@@ -7,7 +7,7 @@ on:
     branches: [main]
   workflow_dispatch:
   schedule:
-    - cron: '3,13,23,33,43,53 * * * *'   # GitHub may run these late
+    - cron: '*/10 * * * *'   # GitHub may run these late, or skip some
 
 permissions:
   contents: read
