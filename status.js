@@ -27,6 +27,7 @@ export const CONFIG = {
     winterPrecipChancePct: 30,// YELLOW if snow/freezing rain chance >= this at DTW
     coatLineAtOrBelowF: 50,   // Detroit: show "keep your coat handy" at/below this
     faaRelevantHoursBefore: 6,// FAA ground stops/delays count only this close to a window
+    faaMaxAgeMinutes: 45,     // faa.json older than this = "not checked" (GitHub cron can run late)
     staleAfterMinutes: 90,    // UI: older cached data stops showing a color
   },
 
@@ -48,6 +49,14 @@ export const CONFIG = {
     brevard: { same: '012009', zone: 'FLC009', name: 'Brevard County' },
     orange:  { same: '012095', zone: 'FLC095', name: 'Orange County' },
     wayne:   { same: '026163', zone: 'MIC163', name: 'Wayne County' },
+  },
+
+  // FAA data. Browsers can't call the FAA (no CORS), so a GitHub Action
+  // (scripts/faa.mjs, every ~10 min) saves it as faa.json next to the page.
+  faa: {
+    url: 'https://nasstatus.faa.gov/api/airport-events',
+    browserUrl: './faa.json',
+    airports: ['MCO', 'DTW'],
   },
 
   // Central Florida box for the hurricane-center cone check (lon/lat).
@@ -137,6 +146,32 @@ function trimOpenMeteo(loc) {
   }));
 }
 
+function faaAirport(a) {
+  if (!a) return null; // not on the FAA list = nothing going on there
+  const d = a.departureDelay || a.arrivalDelay;
+  const range = d?.arrivalDeparture ? `${d.arrivalDeparture.min}–${d.arrivalDeparture.max}`.replace(/ minutes/g, '') + ' minutes' : null;
+  return {
+    groundStop: !!a.groundStop, groundDelay: !!a.groundDelay, closure: !!a.airportClosure,
+    delay: !!d, delayRange: range, deicing: !!a.deicing,
+    reason: (a.groundStop || a.groundDelay || a.airportClosure || d)?.reason || null,
+  };
+}
+
+/** Ask the FAA directly (Node only). Returns { fetchedAt, airports: { MCO, DTW } }. */
+export async function fetchFaa({ fetchImpl = globalThis.fetch, cfg = CONFIG, now = Date.now() } = {}) {
+  const list = await getJSON(cfg.faa.url, fetchImpl);
+  if (!Array.isArray(list)) throw new Error('FAA: unexpected shape');
+  const airports = {};
+  for (const id of cfg.faa.airports) airports[id] = faaAirport(list.find(a => a.airportId === id));
+  return { fetchedAt: now, airports };
+}
+
+function checkFaaFile(j) {
+  if (!j || typeof j.fetchedAt !== 'number') throw new Error('faa.json: unexpected shape');
+  if (!j.ok) throw new Error(`faa.json: last FAA check failed (${j.error || 'unknown'})`);
+  return { fetchedAt: j.fetchedAt, airports: j.airports };
+}
+
 /** Fetch everything. Returns raw-but-trimmed data; never throws. */
 export async function fetchAll({ fetchImpl = globalThis.fetch, cfg = CONFIG, now = Date.now(), inBrowser = IS_BROWSER } = {}) {
   const sections = buildSections(cfg);
@@ -171,16 +206,8 @@ export async function fetchAll({ fetchImpl = globalThis.fetch, cfg = CONFIG, now
         start: Date.parse(p.onset || p.effective), end: p.ends ? Date.parse(p.ends) : null,
       }));
     })),
-    // FAA's API sends no CORS header, so a browser can't read it. Node can.
-    inBrowser ? Promise.resolve(null) : wrap('FAA', getJSON('https://nasstatus.faa.gov/api/airport-events', fetchImpl).then(list => {
-      const pick = id => list.find(a => a.airportId === id) || null;
-      const one = a => a && {
-        groundStop: !!a.groundStop, groundDelay: !!a.groundDelay, closure: !!a.airportClosure,
-        delay: !!(a.arrivalDelay || a.departureDelay),
-        reason: (a.groundStop || a.groundDelay || a.airportClosure || a.departureDelay || a.arrivalDelay)?.reason || null,
-      };
-      return { MCO: one(pick('MCO')), DTW: one(pick('DTW')) };
-    })),
+    // Browser: read faa.json (written by the GitHub Action). Node: ask the FAA directly.
+    wrap('FAA', inBrowser ? getJSON(cfg.faa.browserUrl, fetchImpl).then(checkFaaFile) : fetchFaa({ fetchImpl, cfg })),
     // Atlantic storms AT1–AT5: does any forecast cone touch central Florida?
     wrap('NHC', Promise.all([8, 34, 60, 86, 112].map(id => getJSON(coneQuery(id), fetchImpl)))
       .then(rs => {
@@ -189,7 +216,7 @@ export async function fetchAll({ fetchImpl = globalThis.fetch, cfg = CONFIG, now
       })),
   ]);
 
-  return { fetchedAt: now, nws, om, alerts, faa: inBrowser ? 'not-checked' : faa, nhc, errors };
+  return { fetchedAt: now, nws, om, alerts, faa, nhc, errors };
 }
 
 // ============================================================================
@@ -286,7 +313,7 @@ function evaluateSection(sec, raw, idx, now, cfg) {
   const T = cfg.thresholds;
   const out = {
     id: sec.id, title: sec.title, when: windowLabel(sec), start: sec.start, end: sec.end,
-    status: 'green', headline: '', reasons: [], tips: [], alerts: [], weather: null, source: null, notes: [],
+    status: 'green', headline: '', reasons: [], tips: [], alerts: [], weather: null, source: null, notes: [], airport: null,
   };
   if (now >= sec.end) { out.status = 'done'; out.headline = 'This part of the trip is done.'; return out; }
 
@@ -341,14 +368,30 @@ function evaluateSection(sec, raw, idx, now, cfg) {
 
   // --- FAA -----------------------------------------------------------------------
   if (sec.airport) {
-    const f = raw.faa === 'not-checked' ? 'not-checked' : raw.faa ? raw.faa[sec.airport] : undefined;
-    const relevant = now >= sec.start - T.faaRelevantHoursBefore * 3600e3;
     const city = sec.airport === 'MCO' ? 'Orlando' : 'Detroit';
-    if (f === 'not-checked') out.notes.push(`Airport delays aren't checked by this page. Use the FAA and Delta buttons below.`);
-    else if (f === undefined) out.notes.push('Couldn\'t check FAA airport delays just now.');
-    else if (f && relevant) {
-      if (f.groundStop || f.groundDelay || f.closure) add('red', `The FAA is holding or slowing flights at ${city} right now. Check the Delta app or call Delta before you head to the airport.`, `an FAA hold on flights at ${city}`);
-      else if (f.delay) add('yellow', `The FAA is reporting some delays at ${city}. Keep an eye on the Delta app for your flight.`, `FAA delays at ${city}`);
+    const faa = raw.faa;
+    const fresh = faa && now - faa.fetchedAt <= T.faaMaxAgeMinutes * 60e3;
+    out.airport = { checked: false, asOf: faa?.fetchedAt ?? null, text: '' };
+    if (!faa) out.airport.text = 'Couldn\'t check FAA airport delays just now. Use the FAA button below.';
+    else if (!fresh) out.airport.text = `The FAA airport info is out of date (from ${formatTime(faa.fetchedAt)}). Use the FAA button below.`;
+    else {
+      const f = faa.airports?.[sec.airport] ?? null;
+      const asOf = `(FAA, as of ${formatTime(faa.fetchedAt)})`;
+      const relevant = now >= sec.start - T.faaRelevantHoursBefore * 3600e3;
+      const why = f?.reason && /^WX:/i.test(f.reason) ? ` because of ${f.reason.slice(3).trim().toLowerCase()}` : '';
+      out.airport.checked = true;
+      if (!f || !(f.groundStop || f.groundDelay || f.closure || f.delay)) {
+        out.airport.text = `No delays reported at ${city} ${asOf}.`;
+        if (f?.deicing && relevant) out.airport.text += ` Planes are being de-iced there, which is routine in cold weather and can add a few minutes.`;
+      } else if (!relevant) {
+        out.airport.text = `The FAA shows delays at ${city} right now${why}, but that's well before your trip, so it doesn't count yet ${asOf}.`;
+      } else if (f.groundStop || f.groundDelay || f.closure) {
+        out.airport.text = `The FAA is holding or slowing flights at ${city}${why} ${asOf}.`;
+        add('red', `The FAA is holding or slowing flights at ${city}${why}. Check the Delta app or call Delta before you head to the airport.`, `an FAA hold on flights at ${city}`);
+      } else {
+        out.airport.text = `The FAA reports delays at ${city}${f.delayRange ? ` of ${f.delayRange}` : ''}${why} ${asOf}.`;
+        add('yellow', `The FAA is reporting some delays at ${city}${why}. Keep an eye on the Delta app for your flight.`, `a delay report from the FAA at ${city}`);
+      }
     }
   }
 

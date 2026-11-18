@@ -1,0 +1,59 @@
+# Publishes the site to GitHub Pages, with fresh FAA airport status (faa.json).
+# Runs on every push, by hand, and every ~10 minutes until the trip is over.
+name: Publish site
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: '3,13,23,33,43,53 * * * *'   # GitHub may run these late
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.when.outputs.run }}
+    steps:
+      - id: when
+        name: Skip scheduled runs after the trip (Sat Nov 21, 2026)
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$(date -u +%Y%m%d)" -gt 20261121 ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  publish:
+    needs: check
+    if: needs.check.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Get FAA airport status
+        run: node scripts/faa.mjs faa.json
+      - name: Assemble site
+        run: |
+          mkdir _site
+          cp index.html status.js demo.js manifest.json faa.json og.jpg .nojekyll ./*.png _site/
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deploy
+        uses: actions/deploy-pages@v4

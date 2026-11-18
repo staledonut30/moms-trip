@@ -1,8 +1,9 @@
-// demo.js: fake data for ?demo=green|yellow|red|error|home. Loaded only in demo mode.
+// demo.js: fake data for ?demo=green|yellow|red|faa|error|home. Loaded only in demo mode.
 // It goes through the same evaluate() as live data, so it tests the real logic.
 import { CONFIG, buildSections, evaluate } from './status.js';
 
 const NOW = Date.parse('2026-11-19T20:00:00-05:00'); // Thu 8 PM, the night before
+const FRI_EARLY = Date.parse('2026-11-20T06:30:00-05:00'); // ship docking; FAA data counts now
 const H = 3600e3;
 
 function hours(sec, w) {
@@ -25,6 +26,8 @@ const alert = (event, counties, start, end) => ({
 
 const SCENARIOS = {
   green: { wx: calm, alerts: [], nhc: false },
+  faa: { wx: calm, alerts: [], nhc: false, now: FRI_EARLY,
+    faa: { MCO: { groundStop: false, groundDelay: false, closure: false, delay: true, delayRange: '16–30 minutes', deicing: false, reason: 'WX:Thunderstorms' } } },
   yellow: {
     wx: {
       ...calm,
@@ -48,18 +51,21 @@ const SCENARIOS = {
       alert('Tropical Storm Warning', ['012009', '012095'], '2026-11-19T17:00:00-05:00', null),
     ],
     nhc: true,
+    now: FRI_EARLY,
+    faa: { MCO: { groundStop: true, groundDelay: false, closure: false, delay: false, delayRange: null, deicing: false, reason: 'WX:Thunderstorms' } },
   },
 };
 
-function rawFor(name, fetchedAt = NOW) {
+function rawFor(name, fetchedAt) {
   const sc = SCENARIOS[name] || SCENARIOS.green;
+  fetchedAt ??= sc.now ?? NOW;
   const secs = buildSections(CONFIG);
   return {
     fetchedAt,
     nws: secs.map(s => hours(s, sc.wx[s.id])),
     om: secs.map(s => hours(s, { ...sc.wx[s.id], gustMph: sc.wx[s.id].windMph + 8 })),
     alerts: sc.alerts,
-    faa: 'not-checked',
+    faa: { fetchedAt: fetchedAt - 4 * 60e3, airports: { MCO: null, DTW: null, ...sc.faa } },
     nhc: { threatensCentralFL: sc.nhc },
     errors: [],
   };
@@ -74,6 +80,7 @@ export function demoResult(name) {
     err.now = NOW;
     throw err;
   }
-  return evaluate(rawFor(name), NOW);
+  const raw = rawFor(name);
+  return evaluate(raw, raw.fetchedAt);
 }
 export const DEMO_NOW = NOW;
