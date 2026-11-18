@@ -19,6 +19,9 @@ export const CONFIG = {
   // Show "Welcome home" this many minutes after the scheduled arrival.
   welcomeHomeAfterMinutes: 0,
 
+  // Used only for the page's countdown line.
+  shipArrives: '2026-11-20T06:00:00-05:00',
+
   // Status thresholds (starting points — tune freely).
   thresholds: {
     thunderChancePct: 40,     // YELLOW if thunderstorm chance >= this in a window
